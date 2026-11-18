@@ -1,0 +1,102 @@
+name: android
+
+# Builds Vesper for Android (the android/ folder of the private 3ellwa/vesper,
+# fetched with a read-only deploy key: secret SOURCE_DEPLOY_KEY). Runs here
+# because public repos get free Actions minutes.
+#
+# Started by 3ellwa/vesper (repository_dispatch):
+#  - "android-check" for a push to main that touches android/: a signed APK
+#    kept as a workflow artifact (the compile check);
+#  - "android-release" for an android-vX.Y.Z tag: also published as a release
+#    here with Vesper-android.apk (never marked latest; the site and the app's
+#    updater find it).
+# Nothing here runs for pull requests, so secrets never reach outside code.
+#
+# Signing: ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_PASSWORD
+# (key alias "vesper"). The original keystore lives with Ali; losing it means
+# installed apps can never be updated.
+
+on:
+  repository_dispatch:
+    types: [android-check, android-release]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag (android-vX.Y.Z) or commit of 3ellwa/vesper
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  REF: ${{ github.event.client_payload.ref || inputs.ref }}
+
+# A newer compile check replaces one still running; releases are never cancelled.
+concurrency:
+  group: android-${{ github.event.action == 'android-release' && github.event.client_payload.ref || 'check' }}
+  cancel-in-progress: ${{ github.event.action != 'android-release' }}
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: 3ellwa/vesper
+          ref: ${{ env.REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.9.1'
+      - name: Restore the signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/vesper-release.p12"
+            echo "VESPER_KEYSTORE_FILE=$RUNNER_TEMP/vesper-release.p12" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No signing key secret: the APK is signed with a debug key and can't update a real install."
+          fi
+      - name: Version
+        run: |
+          if [[ "$REF" == android-v* ]]; then
+            echo "VESPER_VERSION_NAME=${REF#android-v}" >> "$GITHUB_ENV"
+          else
+            echo "VESPER_VERSION_NAME=0.1.0-dev.${{ github.run_number }}" >> "$GITHUB_ENV"
+          fi
+          # Version codes must keep growing for updates to install; builds in the
+          # private repo went up to ~60, so these start at 10000.
+          echo "VESPER_VERSION_CODE=$((10000 + ${{ github.run_number }}))" >> "$GITHUB_ENV"
+      - name: Build the APK
+        working-directory: android
+        env:
+          VESPER_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          VESPER_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: gradle assembleRelease --stacktrace
+      - name: Name the APK
+        run: |
+          mkdir -p out
+          cp android/app/build/outputs/apk/release/app-release.apk "out/Vesper-android-$VESPER_VERSION_NAME.apk"
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vesper-android
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish the release
+        if: startsWith(env.REF, 'android-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "out/Vesper-android-$VESPER_VERSION_NAME.apk" out/Vesper-android.apk
+          gh release create "$REF" out/Vesper-android.apk -R "$GITHUB_REPOSITORY" --latest=false --title "vesper for android $VESPER_VERSION_NAME" --notes-file android/RELEASE_NOTES.md
+      - name: Remove the signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/vesper-release.p12"

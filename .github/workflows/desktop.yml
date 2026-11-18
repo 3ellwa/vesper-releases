@@ -1,0 +1,106 @@
+name: desktop release
+
+# Builds Vesper's desktop installers (Windows, macOS, Linux) and uploads them to
+# a DRAFT release here. It runs in this public repo because public repos get
+# free Actions minutes; the source comes from the private 3ellwa/vesper with a
+# read-only deploy key (secret SOURCE_DEPLOY_KEY).
+#
+# Started by 3ellwa/vesper when a vX.Y.Z tag is pushed there (repository_dispatch
+# "desktop-release" with client_payload.ref), or by hand with a ref. Nothing here
+# runs for pull requests, so secrets never reach outside code.
+
+on:
+  repository_dispatch:
+    types: [desktop-release]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag or commit of 3ellwa/vesper to build (e.g. v0.1.7)
+        required: true
+      publish:
+        description: Upload to a draft release
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  REF: ${{ github.event.client_payload.ref || inputs.ref }}
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+            args: --win nsis
+          - name: macos
+            # Intel runner: Apple Silicon runners are often out of capacity. It still builds arm64.
+            os: macos-15-intel
+            args: --mac dmg --x64 --arm64
+          - name: linux
+            os: ubuntu-latest
+            args: --linux AppImage deb
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: 3ellwa/vesper
+          ref: ${{ env.REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build installers
+        run: npm run dist -- ${{ matrix.args }} --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vesper-${{ matrix.name }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.blockmap
+            dist/latest*.yml
+
+  publish:
+    name: upload to a draft release
+    needs: build
+    if: github.event_name == 'repository_dispatch' || inputs.publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: 3ellwa/vesper
+          ref: ${{ env.REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          sparse-checkout: package.json
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version="v$(node -p "require('./package.json').version")"
+          ls -la out
+          if gh release view "$version" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$version" out/* --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$version" out/* --draft --title "vesper ${version#v}" --notes "draft: fill in the notes, then publish." -R "$GITHUB_REPOSITORY"
+          fi
